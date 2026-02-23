@@ -1,6 +1,7 @@
 #!/bin/bash
 # ==========================================================
-# NTP Server Auto Installer for LXC (Proxmox)
+# NTP Server Auto Installer (LXC Proxmox Ready)
+# Version: v1.1
 #
 # Supported OS:
 #   - Rocky Linux 9.x
@@ -8,14 +9,12 @@
 #   - Ubuntu 24.04
 #
 # Features:
-#   - Auto OS detection
-#   - Chrony installation
-#   - Internet auto-detect (fallback local stratum)
-#   - Allow all IP (0.0.0.0/0)
-#   - Firewall auto configuration (if available)
-#   - Timezone Asia/Jakarta
-#   - Dynamic login banner
-#   - Auto README generation
+#   - Colored output
+#   - Versioning
+#   - Auto container detection
+#   - Rocky LXC auto fix (-x mode)
+#   - Internet fallback
+#   - Dynamic colored login banner
 #
 # Copyright (c) 2026 @kangsigi.id
 # License: MIT
@@ -23,35 +22,40 @@
 
 set -e
 
+VERSION="v1.1"
 AUTHOR="@kangsigi.id"
 DEFAULT_NTP_POOL="id.pool.ntp.org"
 TIMEZONE="Asia/Jakarta"
 README_FILE="/root/README-NTP-SERVER.txt"
 PROFILE_SCRIPT="/etc/profile.d/ntp-info.sh"
 
-echo "=============================================="
-echo " NTP Server Auto Installer"
-echo " Author  : $AUTHOR"
-echo "=============================================="
+# ----------------------------------------------------------
+# Color Definitions
+# ----------------------------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+echo -e "${CYAN}==============================================${NC}"
+echo -e "${GREEN} NTP Server Auto Installer ${VERSION}${NC}"
+echo -e "${BLUE} Author  : ${AUTHOR}${NC}"
+echo -e "${CYAN}==============================================${NC}"
 
 # ----------------------------------------------------------
-# 1. Check Root Privilege
+# Root Check
 # ----------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
-   echo "ERROR: Please run this script as root."
+   echo -e "${RED}ERROR: Run as root.${NC}"
    exit 1
 fi
 
 # ----------------------------------------------------------
-# 2. Detect OS
+# OS Detection
 # ----------------------------------------------------------
-if [ ! -f /etc/os-release ]; then
-    echo "ERROR: Cannot detect OS."
-    exit 1
-fi
-
 source /etc/os-release
-
 OS_ID=$ID
 OS_VERSION_FULL=$VERSION_ID
 OS_VERSION_MAJOR=$(echo "$VERSION_ID" | cut -d '.' -f1)
@@ -74,59 +78,48 @@ elif [[ "$OS_ID" == "ubuntu" && "$OS_VERSION_FULL" == "24.04" ]]; then
 fi
 
 if [ "$SUPPORTED" != true ]; then
-    echo ""
-    echo "ERROR: Unsupported OS."
-    echo "Detected: $PRETTY_NAME ($VERSION_ID)"
-    echo ""
-    echo "Supported OS:"
-    echo "- Rocky Linux 9.x"
-    echo "- Rocky Linux 10.x"
-    echo "- Ubuntu 24.04"
+    echo -e "${RED}ERROR: Unsupported OS ($PRETTY_NAME)${NC}"
     exit 1
 fi
 
-echo "Detected OS: $PRETTY_NAME"
+echo -e "${GREEN}Detected OS:${NC} $PRETTY_NAME"
 
 # ----------------------------------------------------------
-# 3. Set Timezone
+# Container Detection
 # ----------------------------------------------------------
-echo "Setting timezone to $TIMEZONE..."
-if command -v timedatectl >/dev/null 2>&1; then
-    timedatectl set-timezone $TIMEZONE || true
-else
-    ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+CONTAINER_MODE=false
+if systemd-detect-virt -q; then
+    CONTAINER_MODE=true
+    echo -e "${YELLOW}Container detected: $(systemd-detect-virt)${NC}"
 fi
 
 # ----------------------------------------------------------
-# 4. Install Chrony
+# Timezone
 # ----------------------------------------------------------
-echo "Installing chrony..."
-eval $PKG_INSTALL || { echo "ERROR: Failed installing chrony."; exit 1; }
+echo -e "${CYAN}Setting timezone → ${TIMEZONE}${NC}"
+timedatectl set-timezone $TIMEZONE 2>/dev/null || \
+ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
 
 # ----------------------------------------------------------
-# 5. Check Internet Connectivity
+# Install Chrony
 # ----------------------------------------------------------
-echo "Checking internet connectivity..."
+echo -e "${CYAN}Installing chrony...${NC}"
+eval $PKG_INSTALL
+
+# ----------------------------------------------------------
+# Internet Check
+# ----------------------------------------------------------
 ONLINE=true
 ping -c 2 8.8.8.8 >/dev/null 2>&1 || ONLINE=false
 
 # ----------------------------------------------------------
-# 6. Backup Existing Config
+# Config Generate
 # ----------------------------------------------------------
-if [ -f /etc/chrony.conf ]; then
-    cp /etc/chrony.conf /etc/chrony.conf.backup.$(date +%F-%H%M%S)
-fi
-
-# ----------------------------------------------------------
-# 7. Generate New Chrony Config
-# ----------------------------------------------------------
-echo "Generating chrony configuration..."
+[ -f /etc/chrony.conf ] && \
+cp /etc/chrony.conf /etc/chrony.conf.backup.$(date +%F-%H%M%S)
 
 cat > /etc/chrony.conf <<EOF
-# ==================================================
-# Chrony Configuration
-# Generated by $AUTHOR
-# ==================================================
+# Generated by $AUTHOR ($VERSION)
 
 server 0.$DEFAULT_NTP_POOL iburst
 server 1.$DEFAULT_NTP_POOL iburst
@@ -142,31 +135,43 @@ EOF
 
 if [ "$ONLINE" = false ]; then
     echo "local stratum 10" >> /etc/chrony.conf
-    echo "WARNING: Internet not detected. Local stratum enabled."
+    echo -e "${YELLOW}No internet detected → Local stratum enabled.${NC}"
 fi
 
 # ----------------------------------------------------------
-# 8. Enable & Start Service
+# Rocky LXC Fix
 # ----------------------------------------------------------
-echo "Starting NTP service..."
+if [[ "$OS_ID" == "rocky" && "$CONTAINER_MODE" == true ]]; then
+    echo -e "${YELLOW}Applying Rocky LXC fix (-x mode)...${NC}"
 
+    mkdir -p /etc/systemd/system/chronyd.service.d
+
+    cat > /etc/systemd/system/chronyd.service.d/override.conf <<EOF
+[Unit]
+ConditionCapability=
+
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/chronyd -x
+EOF
+fi
+
+# ----------------------------------------------------------
+# Start Service
+# ----------------------------------------------------------
+systemctl daemon-reload
 systemctl enable $SERVICE_NAME
 
-if ! systemctl restart $SERVICE_NAME; then
-    echo ""
-    echo "ERROR: Failed to start $SERVICE_NAME"
-    echo "Possible cause: Unprivileged LXC container."
-    echo "Solution:"
-    echo "- Convert container to privileged"
-    echo "- Or allow CAP_SYS_TIME capability"
+if systemctl restart $SERVICE_NAME; then
+    echo -e "${GREEN}NTP service started successfully.${NC}"
+else
+    echo -e "${RED}ERROR: Failed to start $SERVICE_NAME${NC}"
     exit 1
 fi
 
 # ----------------------------------------------------------
-# 9. Configure Firewall (If Available)
+# Firewall
 # ----------------------------------------------------------
-echo "Configuring firewall..."
-
 if [[ "$FIREWALL_TYPE" == "firewalld" ]] && systemctl is-active firewalld >/dev/null 2>&1; then
     firewall-cmd --permanent --add-service=ntp || true
     firewall-cmd --reload || true
@@ -175,10 +180,17 @@ elif [[ "$FIREWALL_TYPE" == "ufw" ]] && command -v ufw >/dev/null 2>&1; then
 fi
 
 # ----------------------------------------------------------
-# 10. Create Dynamic Login Banner
+# Colored Login Banner
 # ----------------------------------------------------------
 cat > $PROFILE_SCRIPT <<'EOF'
 #!/bin/bash
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
 SERVICE="chronyd"
 if systemctl list-units | grep -q chrony.service; then
     SERVICE="chrony"
@@ -187,82 +199,45 @@ fi
 IP=$(hostname -I | awk '{print $1}')
 STATUS=$(systemctl is-active $SERVICE 2>/dev/null)
 SOURCE=$(chronyc sources 2>/dev/null | grep \* | awk '{print $2}')
-TRACK=$(chronyc tracking 2>/dev/null | grep "Leap status")
 
-echo "---------------------------------------------"
-echo "        NTP SERVER INFORMATION"
-echo "---------------------------------------------"
-echo " IP Address     : $IP"
-echo " Service        : $SERVICE ($STATUS)"
-echo " Upstream Pool  : id.pool.ntp.org"
-echo " Active Source  : $SOURCE"
-echo " $TRACK"
-echo "---------------------------------------------"
+echo -e "${CYAN}---------------------------------------------${NC}"
+echo -e "${GREEN}        NTP SERVER INFORMATION${NC}"
+echo -e "${CYAN}---------------------------------------------${NC}"
+echo -e "${BLUE} IP Address     :${NC} $IP"
+echo -e "${BLUE} Service        :${NC} $SERVICE (${GREEN}$STATUS${NC})"
+echo -e "${BLUE} Upstream Pool  :${NC} id.pool.ntp.org"
+echo -e "${BLUE} Active Source  :${NC} $SOURCE"
+echo -e "${CYAN}---------------------------------------------${NC}"
 EOF
 
 chmod +x $PROFILE_SCRIPT
 
 # ----------------------------------------------------------
-# 11. Generate README File
+# README
 # ----------------------------------------------------------
 SERVER_IP=$(hostname -I | awk '{print $1}')
 
 cat > $README_FILE <<EOF
-==================================================
 NTP SERVER INSTALLATION SUMMARY
-Author: $AUTHOR
-==================================================
+Version: $VERSION
+Author : $AUTHOR
 
-Server IP         : $SERVER_IP
-OS                : $PRETTY_NAME
-Service           : $SERVICE_NAME
-Upstream Pool     : id.pool.ntp.org
-Timezone          : $TIMEZONE
-Config File       : /etc/chrony.conf
+Server IP       : $SERVER_IP
+OS              : $PRETTY_NAME
+Container Mode  : $CONTAINER_MODE
+Upstream        : id.pool.ntp.org
+Timezone        : $TIMEZONE
 
---------------------------------------------------
-HOW TO CHANGE UPSTREAM SERVER
---------------------------------------------------
+Rocky LXC mode uses -x automatically.
 
-Edit:
-nano /etc/chrony.conf
-
-Modify server lines and restart:
-
-systemctl restart $SERVICE_NAME
-
---------------------------------------------------
-CHECK STATUS
---------------------------------------------------
-
+Check:
 systemctl status $SERVICE_NAME
 chronyc sources
 chronyc tracking
-
---------------------------------------------------
-LXC TROUBLESHOOTING
---------------------------------------------------
-
-If you see:
-Operation not permitted
-Cannot adjust system clock
-
-Your container is likely unprivileged.
-
-Solutions:
-- Convert container to privileged
-- Allow CAP_SYS_TIME
-
-==================================================
 EOF
 
-# ----------------------------------------------------------
-# 12. Final Output
-# ----------------------------------------------------------
-echo ""
-echo "=============================================="
-echo " NTP Server Installation Completed"
-echo " OS         : $PRETTY_NAME"
-echo " IP Address : $SERVER_IP"
-echo " Service    : $SERVICE_NAME (active)"
-echo "=============================================="
+echo -e "${CYAN}==============================================${NC}"
+echo -e "${GREEN} Installation Completed Successfully ${NC}"
+echo -e "${BLUE} IP Address :${NC} $SERVER_IP"
+echo -e "${BLUE} Service    :${NC} $SERVICE_NAME (running)"
+echo -e "${CYAN}==============================================${NC}"
