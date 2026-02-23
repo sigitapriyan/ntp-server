@@ -1,14 +1,24 @@
 #!/bin/bash
 # ==========================================================
 # NTP Server Auto Installer for LXC (Proxmox)
+#
 # Supported OS:
-#   - Rocky Linux 9 / 10
+#   - Rocky Linux 9.x
+#   - Rocky Linux 10.x
 #   - Ubuntu 24.04
 #
-# Default Upstream: id.pool.ntp.org
-# Timezone: Asia/Jakarta
+# Features:
+#   - Auto OS detection
+#   - Chrony installation
+#   - Internet auto-detect (fallback local stratum)
+#   - Allow all IP (0.0.0.0/0)
+#   - Firewall auto configuration (if available)
+#   - Timezone Asia/Jakarta
+#   - Dynamic login banner
+#   - Auto README generation
 #
 # Copyright (c) 2026 @kangsigi.id
+# License: MIT
 # ==========================================================
 
 set -e
@@ -24,17 +34,17 @@ echo " NTP Server Auto Installer"
 echo " Author  : $AUTHOR"
 echo "=============================================="
 
-# -----------------------------
-# Check root
-# -----------------------------
+# ----------------------------------------------------------
+# 1. Check Root Privilege
+# ----------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
-   echo "ERROR: Please run as root."
+   echo "ERROR: Please run this script as root."
    exit 1
 fi
 
-# -----------------------------
-# Detect OS
-# -----------------------------
+# ----------------------------------------------------------
+# 2. Detect OS
+# ----------------------------------------------------------
 if [ ! -f /etc/os-release ]; then
     echo "ERROR: Cannot detect OS."
     exit 1
@@ -43,19 +53,20 @@ fi
 source /etc/os-release
 
 OS_ID=$ID
-OS_VERSION=$VERSION_ID
+OS_VERSION_FULL=$VERSION_ID
+OS_VERSION_MAJOR=$(echo "$VERSION_ID" | cut -d '.' -f1)
 
 SUPPORTED=false
 SERVICE_NAME=""
 PKG_INSTALL=""
 FIREWALL_TYPE="none"
 
-if [[ "$OS_ID" == "rocky" && ( "$OS_VERSION" == "9" || "$OS_VERSION" == "10" ) ]]; then
+if [[ "$OS_ID" == "rocky" && ( "$OS_VERSION_MAJOR" == "9" || "$OS_VERSION_MAJOR" == "10" ) ]]; then
     SUPPORTED=true
     SERVICE_NAME="chronyd"
     PKG_INSTALL="dnf install -y chrony"
     FIREWALL_TYPE="firewalld"
-elif [[ "$OS_ID" == "ubuntu" && "$OS_VERSION" == "24.04" ]]; then
+elif [[ "$OS_ID" == "ubuntu" && "$OS_VERSION_FULL" == "24.04" ]]; then
     SUPPORTED=true
     SERVICE_NAME="chrony"
     PKG_INSTALL="apt update && apt install -y chrony"
@@ -63,18 +74,22 @@ elif [[ "$OS_ID" == "ubuntu" && "$OS_VERSION" == "24.04" ]]; then
 fi
 
 if [ "$SUPPORTED" != true ]; then
+    echo ""
     echo "ERROR: Unsupported OS."
-    echo "Supported:"
-    echo "- Rocky Linux 9 / 10"
+    echo "Detected: $PRETTY_NAME ($VERSION_ID)"
+    echo ""
+    echo "Supported OS:"
+    echo "- Rocky Linux 9.x"
+    echo "- Rocky Linux 10.x"
     echo "- Ubuntu 24.04"
     exit 1
 fi
 
 echo "Detected OS: $PRETTY_NAME"
 
-# -----------------------------
-# Set Timezone
-# -----------------------------
+# ----------------------------------------------------------
+# 3. Set Timezone
+# ----------------------------------------------------------
 echo "Setting timezone to $TIMEZONE..."
 if command -v timedatectl >/dev/null 2>&1; then
     timedatectl set-timezone $TIMEZONE || true
@@ -82,30 +97,30 @@ else
     ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
 fi
 
-# -----------------------------
-# Install Chrony
-# -----------------------------
+# ----------------------------------------------------------
+# 4. Install Chrony
+# ----------------------------------------------------------
 echo "Installing chrony..."
-eval $PKG_INSTALL || { echo "ERROR: Failed installing chrony"; exit 1; }
+eval $PKG_INSTALL || { echo "ERROR: Failed installing chrony."; exit 1; }
 
-# -----------------------------
-# Internet Check
-# -----------------------------
+# ----------------------------------------------------------
+# 5. Check Internet Connectivity
+# ----------------------------------------------------------
 echo "Checking internet connectivity..."
 ONLINE=true
 ping -c 2 8.8.8.8 >/dev/null 2>&1 || ONLINE=false
 
-# -----------------------------
-# Backup config
-# -----------------------------
+# ----------------------------------------------------------
+# 6. Backup Existing Config
+# ----------------------------------------------------------
 if [ -f /etc/chrony.conf ]; then
     cp /etc/chrony.conf /etc/chrony.conf.backup.$(date +%F-%H%M%S)
 fi
 
-# -----------------------------
-# Generate chrony config
-# -----------------------------
-echo "Configuring chrony..."
+# ----------------------------------------------------------
+# 7. Generate New Chrony Config
+# ----------------------------------------------------------
+echo "Generating chrony configuration..."
 
 cat > /etc/chrony.conf <<EOF
 # ==================================================
@@ -127,26 +142,29 @@ EOF
 
 if [ "$ONLINE" = false ]; then
     echo "local stratum 10" >> /etc/chrony.conf
-    echo "WARNING: No internet detected. Local stratum enabled."
+    echo "WARNING: Internet not detected. Local stratum enabled."
 fi
 
-# -----------------------------
-# Enable & Start Service
-# -----------------------------
+# ----------------------------------------------------------
+# 8. Enable & Start Service
+# ----------------------------------------------------------
 echo "Starting NTP service..."
+
 systemctl enable $SERVICE_NAME
+
 if ! systemctl restart $SERVICE_NAME; then
-    echo "ERROR: NTP service failed to start."
-    echo "Possible cause: LXC unprivileged container."
+    echo ""
+    echo "ERROR: Failed to start $SERVICE_NAME"
+    echo "Possible cause: Unprivileged LXC container."
     echo "Solution:"
-    echo "- Set container as privileged"
-    echo "- Or allow CAP_SYS_TIME"
+    echo "- Convert container to privileged"
+    echo "- Or allow CAP_SYS_TIME capability"
     exit 1
 fi
 
-# -----------------------------
-# Firewall Setup
-# -----------------------------
+# ----------------------------------------------------------
+# 9. Configure Firewall (If Available)
+# ----------------------------------------------------------
 echo "Configuring firewall..."
 
 if [[ "$FIREWALL_TYPE" == "firewalld" ]] && systemctl is-active firewalld >/dev/null 2>&1; then
@@ -156,28 +174,23 @@ elif [[ "$FIREWALL_TYPE" == "ufw" ]] && command -v ufw >/dev/null 2>&1; then
     ufw allow 123/udp || true
 fi
 
-# -----------------------------
-# Get IP
-# -----------------------------
-SERVER_IP=$(hostname -I | awk '{print $1}')
-
-# -----------------------------
-# Create Login Info Script
-# -----------------------------
+# ----------------------------------------------------------
+# 10. Create Dynamic Login Banner
+# ----------------------------------------------------------
 cat > $PROFILE_SCRIPT <<'EOF'
 #!/bin/bash
 SERVICE="chronyd"
-if systemctl list-units | grep -q chrony; then
+if systemctl list-units | grep -q chrony.service; then
     SERVICE="chrony"
 fi
 
 IP=$(hostname -I | awk '{print $1}')
-STATUS=$(systemctl is-active $SERVICE)
+STATUS=$(systemctl is-active $SERVICE 2>/dev/null)
 SOURCE=$(chronyc sources 2>/dev/null | grep \* | awk '{print $2}')
 TRACK=$(chronyc tracking 2>/dev/null | grep "Leap status")
 
 echo "---------------------------------------------"
-echo " NTP SERVER INFORMATION"
+echo "        NTP SERVER INFORMATION"
 echo "---------------------------------------------"
 echo " IP Address     : $IP"
 echo " Service        : $SERVICE ($STATUS)"
@@ -189,9 +202,11 @@ EOF
 
 chmod +x $PROFILE_SCRIPT
 
-# -----------------------------
-# Create README
-# -----------------------------
+# ----------------------------------------------------------
+# 11. Generate README File
+# ----------------------------------------------------------
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
 cat > $README_FILE <<EOF
 ==================================================
 NTP SERVER INSTALLATION SUMMARY
@@ -212,10 +227,8 @@ HOW TO CHANGE UPSTREAM SERVER
 Edit:
 nano /etc/chrony.conf
 
-Replace:
-server 0.id.pool.ntp.org iburst
+Modify server lines and restart:
 
-Then restart:
 systemctl restart $SERVICE_NAME
 
 --------------------------------------------------
@@ -227,19 +240,29 @@ chronyc sources
 chronyc tracking
 
 --------------------------------------------------
-IF SERVICE FAILS IN LXC
+LXC TROUBLESHOOTING
 --------------------------------------------------
 
-Container may be unprivileged.
+If you see:
+Operation not permitted
+Cannot adjust system clock
+
+Your container is likely unprivileged.
+
 Solutions:
-- Set container as privileged
+- Convert container to privileged
 - Allow CAP_SYS_TIME
 
 ==================================================
 EOF
 
+# ----------------------------------------------------------
+# 12. Final Output
+# ----------------------------------------------------------
+echo ""
 echo "=============================================="
-echo " NTP Server installation completed successfully"
+echo " NTP Server Installation Completed"
+echo " OS         : $PRETTY_NAME"
 echo " IP Address : $SERVER_IP"
 echo " Service    : $SERVICE_NAME (active)"
 echo "=============================================="
